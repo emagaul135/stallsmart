@@ -121,6 +121,98 @@ function toBadge(inferenceSourceValue) {
 }
 
 /**
+ * Extract text + actual inference source from a generateContent() result.
+ *
+ * ROOT CAUSE (found 2026-11-18, M3e): in firebase-ai v13,
+ * `GenerativeModel.generateContent()` returns a `GenerateContentResult`
+ * WRAPPER — `{ response: EnhancedGenerateContentResponse }`. The `text()`
+ * helper and the `inferenceSource` property live on `result.response`, NOT
+ * on the result itself. Calling `result.text()` throws
+ * "TypeError: result.text is not a function" (minified in the live demo as
+ * "a.text is not a function" / "o.text is not a function") and reading
+ * `result.inferenceSource` yields `undefined`, which also broke
+ * probeOnDevice() (always reported on-device as unavailable).
+ *
+ * This helper unwraps the result and reads the SDK's documented accessor,
+ * with a safe fallback to the raw `candidates[0].content.parts` text when
+ * the helper is absent (e.g. a future SDK shape change). It is exported so
+ * the harness can feed it a REAL-shaped SDK response and catch this class
+ * of bug locally.
+ *
+ * @param {object} result - the value returned by model.generateContent()
+ * @returns {{ text: string, inferenceSource: string|undefined }}
+ */
+export function extractAiResponse(result) {
+  const resp =
+    result && typeof result === "object" &&
+    result.response && typeof result.response === "object"
+      ? result.response
+      : result;
+
+  let text = "";
+  if (resp && typeof resp.text === "function") {
+    // The SDK's documented accessor. It throws on blocked/empty responses;
+    // let that propagate so callers show the real SDK error, not a silent "".
+    text = resp.text();
+  } else {
+    // Shape tolerance: raw GenerateContentResponse JSON without helpers.
+    const parts = resp?.candidates?.[0]?.content?.parts ?? [];
+    text = parts
+      .filter((p) => p && typeof p.text === "string")
+      .map((p) => p.text)
+      .join("");
+  }
+
+  const inferenceSource = resp?.inferenceSource ?? result?.inferenceSource;
+  return { text, inferenceSource };
+}
+
+/**
+ * Resolve the badge source: prefer the ACTUAL inference source returned by
+ * the SDK (it reflects the path really taken, including cloud fallback when
+ * on-device was unavailable); fall back to the routing decision only when
+ * the SDK returned nothing (defensive — should not happen with this SDK).
+ */
+function resolveBadge(sdkSource, routedSource) {
+  return toBadge(sdkSource ?? routedSource);
+}
+
+/**
+ * Annotate the routing reason when the ACTUAL source differs from the
+ * routed one (e.g. PREFER_ON_DEVICE fell back to the cloud because Gemini
+ * Nano was unavailable). Keeps the "What ran where & why" panel honest:
+ * the badge shows the actual source, and the reason explains the fallback.
+ */
+function annotateReason(reason, sdkSource, routedSource) {
+  if (!sdkSource || sdkSource === routedSource) return reason;
+  if (sdkSource === InferenceSource.ON_DEVICE || sdkSource === "on_device") {
+    return `${reason} The cloud was unreachable, so this ran on-device instead.`;
+  }
+  return `${reason} On-device model was unavailable, so this fell back to the cloud.`;
+}
+
+// ---------------------------------------------------------------------------
+// Offline simulation (demo only — honest, no faked results)
+// ---------------------------------------------------------------------------
+
+/**
+ * When true, the app behaves as if it were offline: cloud calls are
+ * blocked with a needs-internet error, while on-device calls keep working
+ * (that is the real offline behaviour — Gemini Nano runs locally).
+ * Wired to the "Simulate offline" checkbox in the Hybrid Status panel.
+ * Clearly labelled as a simulation in the UI; it never fabricates results.
+ */
+let _simulateOffline = false;
+
+export function setSimulateOffline(value) {
+  _simulateOffline = !!value;
+}
+
+export function isSimulateOffline() {
+  return _simulateOffline;
+}
+
+/**
  * Try to parse the model's text response as JSON items array.
  * Returns the array or null on failure.
  */
@@ -139,10 +231,11 @@ function tryParseItems(text) {
 
 /**
  * Check if we are online.  Throws an error with { needsInternet: true } when
- * navigator.onLine is false, so callers can show the right message.
+ * navigator.onLine is false OR the offline simulation is on, so callers can
+ * show the right message. Exported so the harness can test it for real.
  */
-function requireOnline() {
-  if (!navigator.onLine) {
+export function requireOnline() {
+  if (_simulateOffline || !navigator.onLine) {
     const err = new Error("This request needs an internet connection. Please check your signal and try again.");
     err.needsInternet = true;
     throw err;
@@ -195,17 +288,21 @@ export async function parseSupplierMessage(text) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       generationConfig,
     });
-    inferenceSourceValue = response.inferenceSource;
+    // generateContent() returns a { response } WRAPPER — unwrap it via
+    // extractAiResponse (see its doc comment for the root cause).
+    const extracted = extractAiResponse(response);
+    inferenceSourceValue = extracted.inferenceSource;
+    response = extracted; // from here on, `response` is { text, inferenceSource }
   } catch (err) {
     // If the error is offline-related on an on-device model, check online and
     // propagate.
-    if (!navigator.onLine) {
+    if (!navigator.onLine || _simulateOffline) {
       requireOnline(); // throws needsInternet
     }
     throw err;
   }
 
-  const rawText = response.text();
+  const rawText = response.text;
   let items = tryParseItems(rawText);
 
   // On-device returned unparseable output → retry once in cloud.
@@ -216,14 +313,15 @@ export async function parseSupplierMessage(text) {
   ) {
     requireOnline(); // cloud retry needs internet
     try {
-      const retryResponse = await _aiInCloud.generateContent({
+      const retryResult = await _aiInCloud.generateContent({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig,
       });
-      inferenceSourceValue = retryResponse.inferenceSource;
-      items = tryParseItems(retryResponse.text());
+      const retryExtracted = extractAiResponse(retryResult);
+      inferenceSourceValue = retryExtracted.inferenceSource;
+      items = tryParseItems(retryExtracted.text);
     } catch (retryErr) {
-      if (!navigator.onLine) requireOnline();
+      if (!navigator.onLine || _simulateOffline) requireOnline();
       throw retryErr;
     }
   }
@@ -244,8 +342,10 @@ export async function parseSupplierMessage(text) {
 
   return {
     items,
-    inferenceSource: toBadge(inferenceSourceValue),
-    reason,
+    // Badge shows the ACTUAL source the SDK reported; fall back to the
+    // routing decision only if the SDK returned nothing.
+    inferenceSource: resolveBadge(inferenceSourceValue, isLong ? "in_cloud" : "on_device"),
+    reason: annotateReason(reason, inferenceSourceValue, isLong ? "in_cloud" : "on_device"),
   };
 }
 
@@ -287,14 +387,15 @@ export async function askStallSmart(question) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine) requireOnline();
+    if (!navigator.onLine || _simulateOffline) requireOnline();
     throw err;
   }
 
+  const extracted = extractAiResponse(response);
   return {
-    answer:          response.text(),
-    inferenceSource: toBadge(response.inferenceSource),
-    reason,
+    answer:          extracted.text,
+    inferenceSource: resolveBadge(extracted.inferenceSource, isLong ? "in_cloud" : "on_device"),
+    reason:          annotateReason(reason, extracted.inferenceSource, isLong ? "in_cloud" : "on_device"),
   };
 }
 
@@ -338,14 +439,15 @@ export async function getDailySummary(salesData) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine) requireOnline();
+    if (!navigator.onLine || _simulateOffline) requireOnline();
     throw err;
   }
 
+  const extracted = extractAiResponse(response);
   return {
-    summary:         response.text(),
-    inferenceSource: toBadge(response.inferenceSource),
-    reason,
+    summary:         extracted.text,
+    inferenceSource: resolveBadge(extracted.inferenceSource, "on_device"),
+    reason:          annotateReason(reason, extracted.inferenceSource, "on_device"),
   };
 }
 
@@ -396,14 +498,15 @@ export async function getWeeklySummary(salesRows, maxChars = 4000) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine) requireOnline();
+    if (!navigator.onLine || _simulateOffline) requireOnline();
     throw err;
   }
 
+  const extracted = extractAiResponse(response);
   return {
-    summary:         response.text(),
-    inferenceSource: toBadge(response.inferenceSource),
-    reason,
+    summary:         extracted.text,
+    inferenceSource: resolveBadge(extracted.inferenceSource, "in_cloud"),
+    reason:          annotateReason(reason, extracted.inferenceSource, "in_cloud"),
   };
 }
 
@@ -433,7 +536,9 @@ export async function probeOnDevice() {
     });
 
     // If the response came from on-device, the model is available.
-    const src = response.inferenceSource;
+    // NOTE: generateContent() returns a { response } wrapper — the source
+    // lives on the unwrapped response (see extractAiResponse).
+    const src = extractAiResponse(response).inferenceSource;
     return (
       src === InferenceSource.ON_DEVICE ||
       src === "on_device"

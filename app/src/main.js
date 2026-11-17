@@ -29,6 +29,8 @@ import {
   getDailySummary,
   getWeeklySummary,
   probeOnDevice,
+  setSimulateOffline,
+  isSimulateOffline,
   AI_DEMO_MODE,
 } from "./ai.js";
 import {
@@ -104,7 +106,10 @@ function initIndicators() {
 
   const updateConnection = () => {
     const pill = el("connection-pill");
-    if (navigator.onLine) {
+    if (isSimulateOffline()) {
+      pill.textContent = "● Simulated offline";
+      pill.className = "pill pill-offline";
+    } else if (navigator.onLine) {
       pill.textContent = "● Online";
       pill.className = "pill pill-online";
     } else {
@@ -115,6 +120,14 @@ function initIndicators() {
   updateConnection();
   window.addEventListener("online",  updateConnection);
   window.addEventListener("offline", updateConnection);
+
+  // Offline simulation toggle (Hybrid Status panel): blocks cloud calls so
+  // the offline demo can be shown without DevTools. Honest simulation —
+  // on-device calls keep working, cloud calls fail with needs-internet.
+  el("chk-simulate-offline").addEventListener("change", (e) => {
+    setSimulateOffline(e.target.checked);
+    updateConnection();
+  });
 }
 
 // ---------------------------------------------------------------------------

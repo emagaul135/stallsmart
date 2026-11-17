@@ -27,7 +27,8 @@
  *  13.  badges: badgeHtml returns ON-DEVICE badge string
  *  14.  badges: badgeHtml returns IN-CLOUD badge string
  *  15.  badges: badgeHtml returns DEMO badge string
- *  16.  offline message: requireOnline throws with needsInternet=true
+ *  16.  offline message: the REAL exported requireOnline throws with
+ *       needsInternet when offline OR when the offline simulation is on
  *  17.  low-stock flag: items with qty ≤ LOW_STOCK_THRESHOLD are detected
  *  18.  AI_DEMO_MODE is false (live config wired)
  *  19.  STORE_DEMO_MODE is false (live config wired)
@@ -36,6 +37,10 @@
  *  22.  DEMO_WEEKLY_SUMMARY has expected shape
  *  23.  demo-data: DEMO_ASK_RESPONSES has ≥1 entry with keywords array
  *  24.  demo-data: DEMO_ASK_FALLBACK has an answer string
+ *  25-30. M3e regression tests: extractAiResponse() against the REAL
+ *       firebase-ai v13 GenerateContentResult shape ({ response } wrapper,
+ *       text() on .response, candidates-parts fallback, bare response,
+ *       wrapper-has-no-.text() guard, raw source values for badges)
  */
 
 import { createRequire } from "module";
@@ -101,7 +106,7 @@ const {
   getRemoteConfigValue,
 } = storePkg;
 
-const { AI_DEMO_MODE } = aiPkg;
+const { AI_DEMO_MODE, extractAiResponse, requireOnline, setSimulateOffline, isSimulateOffline } = aiPkg;
 const { isPlaceholderConfig, RC_DEFAULTS, firebaseConfig, APP_CHECK_DEBUG_TOKEN } = cfgPkg;
 
 // ---------------------------------------------------------------------------
@@ -305,18 +310,9 @@ assert(
   "badgeHtml('DEMO') contains correct class and label"
 );
 
-// 16. Offline message: requireOnline throws with needsInternet
-//   We can test this by temporarily making navigator.onLine false and calling
-//   the ai.js helper indirectly.  Since requireOnline is not exported, we
-//   simulate the same behaviour here to validate the logic.
-function requireOnline() {
-  if (!navigator.onLine) {
-    const err = new Error("needs internet");
-    err.needsInternet = true;
-    throw err;
-  }
-}
-
+// 16. Offline message: the REAL exported requireOnline throws with
+//   needsInternet when navigator is offline, and when the offline
+//   simulation is on (M3e: previously this was only mirrored locally).
 _onLine = false;
 let caughtNeedsInternet = false;
 try {
@@ -326,6 +322,23 @@ try {
 }
 _onLine = true; // restore
 assert(caughtNeedsInternet, "requireOnline() throws error with needsInternet=true when offline");
+setSimulateOffline(true);
+let caughtSimulated = false;
+try {
+  requireOnline();
+} catch (e) {
+  caughtSimulated = e.needsInternet === true;
+}
+setSimulateOffline(false);
+assert(caughtSimulated, "requireOnline() throws error with needsInternet=true when offline simulation is on");
+let onlineOk = true;
+try {
+  requireOnline();
+} catch {
+  onlineOk = false;
+}
+assert(onlineOk, "requireOnline() does not throw when online and simulation is off");
+assert(isSimulateOffline() === false, "isSimulateOffline() is false after simulation is turned off");
 
 // 17. Low-stock flags
 const saltItem = DEMO_STOCK.find((s) => s.name === "Salt 500g");
@@ -384,6 +397,78 @@ assert(
   typeof DEMO_ASK_FALLBACK.answer === "string" &&
   DEMO_ASK_FALLBACK.answer.length > 10,
   "DEMO_ASK_FALLBACK has a non-empty answer string"
+);
+
+// ---------------------------------------------------------------------------
+// 25-30. M3e regression tests — real firebase-ai v13 response shape
+//
+// Root cause (live verification 2026-11-17): generateContent() returns a
+// GenerateContentResult WRAPPER { response: EnhancedGenerateContentResponse }.
+// The text() helper and inferenceSource live on result.response, NOT on the
+// result. ai.js called result.text() directly → "a.text is not a function"
+// on every Parse/Ask path, and probeOnDevice() always read undefined.
+// These tests feed extractAiResponse() the REAL shape the installed SDK
+// returns (built to mirror createEnhancedContentResponse + addHelpers in
+// node_modules/@firebase/ai), so this class of bug is caught locally.
+// ---------------------------------------------------------------------------
+
+/** Build a GenerateContentResult exactly as the SDK returns it. */
+function makeSdkResult({ text, source, withHelper = true }) {
+  const inner = {
+    candidates: [{ index: 0, content: { parts: [{ text }] } }],
+    inferenceSource: source,
+  };
+  if (withHelper) inner.text = () => text; // addHelpers() in the SDK
+  return { response: inner };
+}
+
+const SAMPLE_JSON = '[{"name":"Rice 10kg","quantity":5,"unit":"sack","unitPriceUsd":12}]';
+
+// 25. Real SDK wrapper with text() helper + on-device source
+const sdkOnDevice = makeSdkResult({ text: SAMPLE_JSON, source: "on_device" });
+const extractedOnDevice = extractAiResponse(sdkOnDevice);
+assertEqual(extractedOnDevice.text, SAMPLE_JSON, "extractAiResponse unwraps SDK wrapper: text() via .response");
+assertEqual(extractedOnDevice.inferenceSource, "on_device", "extractAiResponse unwraps SDK wrapper: inferenceSource 'on_device'");
+
+// 26. Real SDK wrapper with text() helper + in-cloud source
+const sdkInCloud = makeSdkResult({ text: "Fresh stock looks good.", source: "in_cloud" });
+const extractedInCloud = extractAiResponse(sdkInCloud);
+assertEqual(extractedInCloud.text, "Fresh stock looks good.", "extractAiResponse unwraps SDK wrapper: in-cloud text");
+assertEqual(extractedInCloud.inferenceSource, "in_cloud", "extractAiResponse unwraps SDK wrapper: inferenceSource 'in_cloud'");
+
+// 27. Raw response WITHOUT the text() helper (shape tolerance) —
+//   falls back to candidates[0].content.parts text.
+const rawNoHelper = makeSdkResult({ text: SAMPLE_JSON, source: "in_cloud", withHelper: false });
+const extractedRaw = extractAiResponse(rawNoHelper);
+assertEqual(extractedRaw.text, SAMPLE_JSON, "extractAiResponse falls back to candidates parts text when text() helper is absent");
+assertEqual(extractedRaw.inferenceSource, "in_cloud", "extractAiResponse still reads inferenceSource without the helper");
+
+// 28. Bare response object (no wrapper) is tolerated too.
+const bareResponse = {
+  candidates: [{ index: 0, content: { parts: [{ text: "hello" }] } }],
+  inferenceSource: "on_device",
+  text: () => "hello",
+};
+const extractedBare = extractAiResponse(bareResponse);
+assertEqual(extractedBare.text, "hello", "extractAiResponse tolerates a bare response object (no wrapper)");
+assertEqual(extractedBare.inferenceSource, "on_device", "extractAiResponse reads inferenceSource from a bare response");
+
+// 29. Regression guard — the trap itself: the GenerateContentResult wrapper
+//   has NO .text() method. Any code calling result.text() directly is the bug.
+assert(
+  typeof sdkOnDevice.text === "undefined",
+  "REGRESSION GUARD: GenerateContentResult wrapper has no .text() — callers must unwrap .response first"
+);
+assert(
+  typeof sdkOnDevice.response.text === "function",
+  "REGRESSION GUARD: .text() lives on result.response (SDK addHelpers)"
+);
+
+// 30. InferenceSource enum values map to the badge strings used by the UI.
+assert(
+  extractedOnDevice.inferenceSource === "on_device" &&
+  extractedInCloud.inferenceSource === "in_cloud",
+  "extractAiResponse returns raw SDK source values ('on_device'/'in_cloud') for badge mapping"
 );
 
 // ---------------------------------------------------------------------------
