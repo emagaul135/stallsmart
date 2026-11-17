@@ -1,0 +1,18 @@
+{
+  "name": "stallsmart",
+  "version": "0.1.0",
+  "description": "Offline-first AI bookkeeper for market vendors — #BuildHybridAI 2026",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "firebase": "^13.0.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

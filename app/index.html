@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StallSmart — AI Bookkeeper for Market Vendors</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- ========= HEADER ========= -->
+  <header id="app-header">
+    <div class="header-brand">
+      <span class="brand-icon">🏪</span>
+      <h1>StallSmart</h1>
+      <span class="tagline">AI Bookkeeper for Market Vendors</span>
+    </div>
+    <div class="header-status">
+      <span id="connection-pill" class="pill pill-online">● Online</span>
+      <span id="demo-badge" class="pill pill-demo hidden">DEMO MODE</span>
+    </div>
+  </header>
+
+  <main id="app-main">
+
+    <!-- ========= PARSE CARD ========= -->
+    <section id="section-parse" class="card">
+      <h2>📋 Parse Supplier Message</h2>
+      <p class="section-hint">Paste a supplier message (WhatsApp, SMS, chat) and StallSmart will extract items, quantities, and prices.</p>
+
+      <div class="parse-controls">
+        <textarea
+          id="parse-input"
+          placeholder="e.g. Beras 10kg x5 sacks @$12, Sugar 1kg x10 @$1.50, Cooking oil 1L x8 @$2.20"
+          rows="5"
+        ></textarea>
+        <div class="parse-actions">
+          <button id="btn-parse" class="btn btn-primary">⚡ Parse</button>
+          <button id="btn-load-demo" class="btn btn-secondary">Load demo message</button>
+        </div>
+      </div>
+
+      <div id="parse-routing" class="routing-explainer hidden">
+        <!-- routing reason + badge inserted here -->
+      </div>
+
+      <div id="parse-loading" class="loading-row hidden">
+        <span class="spinner"></span> Parsing with AI…
+      </div>
+      <p id="parse-error" class="error-message hidden"></p>
+    </section>
+
+    <!-- ========= PARSED RESULTS (editable) ========= -->
+    <section id="section-parsed-results" class="card hidden">
+      <h2>✏️ Review &amp; Edit Parsed Items</h2>
+      <p class="section-hint">Review the AI-parsed items below. Edit any row before saving.</p>
+
+      <div class="table-wrapper">
+        <table id="parsed-table">
+          <thead>
+            <tr>
+              <th>Item Name</th>
+              <th>Qty</th>
+              <th>Unit</th>
+              <th>Unit Price (USD)</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="parsed-tbody">
+            <!-- rows inserted by main.js -->
+          </tbody>
+        </table>
+      </div>
+
+      <div class="parsed-footer">
+        <button id="btn-save-stock" class="btn btn-primary">💾 Save to Inventory</button>
+        <button id="btn-clear-parsed" class="btn btn-ghost">✕ Discard</button>
+      </div>
+    </section>
+
+    <!-- ========= INVENTORY ========= -->
+    <section id="section-inventory" class="card">
+      <h2>📦 Inventory</h2>
+      <div class="inventory-controls">
+        <input id="inventory-search" type="search" placeholder="Search items…" />
+        <span id="low-stock-filter-wrap">
+          <label>
+            <input id="chk-low-stock" type="checkbox" />
+            Show low-stock only
+          </label>
+        </span>
+      </div>
+
+      <div class="table-wrapper">
+        <table id="inventory-table">
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Qty</th>
+              <th>Unit</th>
+              <th>Cost/Unit</th>
+              <th>Source</th>
+              <th>Added</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-tbody">
+            <!-- rows inserted by main.js -->
+          </tbody>
+        </table>
+      </div>
+      <p id="inventory-empty" class="empty-state hidden">No items in inventory yet. Parse a supplier message to get started.</p>
+    </section>
+
+    <!-- ========= SALES LOG + PROFIT DASHBOARD ========= -->
+    <section id="section-sales" class="card">
+      <h2>💰 Log a Sale</h2>
+      <div class="sale-form">
+        <select id="sale-item" aria-label="Item">
+          <option value="">— select item —</option>
+        </select>
+        <input id="sale-qty" type="number" min="0.01" step="0.01" placeholder="Qty" />
+        <input id="sale-price" type="number" min="0.01" step="0.01" placeholder="Sale price/unit (USD)" />
+        <button id="btn-log-sale" class="btn btn-primary">Log Sale</button>
+      </div>
+    </section>
+
+    <section id="section-dashboard" class="card">
+      <h2>📊 Today's Profit Dashboard</h2>
+      <div class="dashboard-cards">
+        <div class="stat-card">
+          <span class="stat-label">Revenue</span>
+          <span id="stat-revenue" class="stat-value">$0.00</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">Cost</span>
+          <span id="stat-cost" class="stat-value">$0.00</span>
+        </div>
+        <div class="stat-card stat-card-profit">
+          <span class="stat-label">Profit</span>
+          <span id="stat-profit" class="stat-value">$0.00</span>
+        </div>
+      </div>
+
+      <h3>Top Items Today</h3>
+      <ul id="top-items-list" class="top-items-list">
+        <!-- inserted by main.js -->
+      </ul>
+      <p id="dashboard-empty" class="empty-state">No sales logged today.</p>
+
+      <!-- AI summaries -->
+      <div class="summary-actions">
+        <button id="btn-daily-summary" class="btn btn-secondary">🤖 Daily Summary <small>(on-device)</small></button>
+        <button id="btn-weekly-summary" class="btn btn-secondary">☁️ Weekly Analysis <small>(cloud)</small></button>
+      </div>
+
+      <div id="daily-summary-loading" class="loading-row hidden">
+        <span class="spinner"></span> Generating daily summary on-device…
+      </div>
+      <div id="weekly-summary-loading" class="loading-row hidden">
+        <span class="spinner"></span> Running weekly analysis in the cloud…
+      </div>
+
+      <div id="daily-summary-result" class="ai-result hidden">
+        <div id="daily-summary-badge-row" class="badge-row"></div>
+        <p id="daily-summary-text"></p>
+      </div>
+
+      <div id="weekly-summary-result" class="ai-result hidden">
+        <div id="weekly-summary-badge-row" class="badge-row"></div>
+        <p id="weekly-summary-text"></p>
+      </div>
+
+      <p id="summary-error" class="error-message hidden"></p>
+    </section>
+
+    <!-- ========= ASK STALLSMART ========= -->
+    <section id="section-ask" class="card">
+      <h2>🤖 Ask StallSmart</h2>
+      <p class="section-hint">Ask a short question about pricing or stock. Short questions run on-device; longer analysis goes to the cloud.</p>
+      <div class="ask-controls">
+        <input id="ask-input" type="text" placeholder="e.g. Is $12/sack for rice a good price?" />
+        <button id="btn-ask" class="btn btn-primary">Ask</button>
+      </div>
+      <div id="ask-loading" class="loading-row hidden">
+        <span class="spinner"></span> Thinking…
+      </div>
+      <p id="ask-error" class="error-message hidden"></p>
+      <div id="ask-result" class="ai-result hidden">
+        <div id="ask-badge-row" class="badge-row"></div>
+        <p id="ask-answer"></p>
+      </div>
+    </section>
+
+    <!-- ========= HYBRID STATUS PANEL ========= -->
+    <section id="section-status" class="card">
+      <h2>🔀 Hybrid AI Status</h2>
+      <dl class="status-list">
+        <dt>On-device model</dt>
+        <dd id="status-ondevice">Checking…</dd>
+
+        <dt>Active inference mode</dt>
+        <dd id="status-mode">—</dd>
+
+        <dt>Last request</dt>
+        <dd id="status-last">None yet</dd>
+
+        <dt>What ran where &amp; why</dt>
+        <dd id="status-reason">No AI call made yet.</dd>
+      </dl>
+    </section>
+
+  </main>
+
+  <!-- ========= FOOTER ========= -->
+  <footer id="app-footer">
+    <span id="footer-demo-note"></span>
+    <span class="footer-credit">StallSmart · #BuildHybridAI 2026</span>
+  </footer>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+# Dependencies + build output
+node_modules/
+dist/
+
+# Local-only environment files (may hold the App Check debug token — NEVER commit)
+.env.local
+.env.*.local
+
+# OS / editor noise
+.DS_Store
