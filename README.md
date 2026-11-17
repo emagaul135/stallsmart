@@ -150,7 +150,7 @@ Target: a single continuous screen recording in Chrome on a machine with Gemini 
 
 - [x] Real Firebase config in `firebase-config.js`
 - [x] Public GitHub repo (emagaul135) with open-source licence (MIT)
-- [ ] Deploy to GitHub Pages, free for judges (domain must be added to the reCAPTCHA Enterprise key)
+- [x] Deploy to GitHub Pages, free for judges: https://emagaul135.github.io/stallsmart/ (status: built, HTTP 200). NOTE: live AI calls need emagaul135.github.io added to the reCAPTCHA Enterprise key's domain list first.
 - [ ] Demo video < 3 min on public YouTube, English/captions
 - [ ] Devpost registration (oyentv770) + submission before **1 Dec 2026 05:00 WIB**
 
