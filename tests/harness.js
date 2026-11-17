@@ -104,9 +104,22 @@ const {
   logSale,
   deductStock,
   getRemoteConfigValue,
+  normalizeDocDates,
 } = storePkg;
 
-const { AI_DEMO_MODE, extractAiResponse, requireOnline, setSimulateOffline, isSimulateOffline } = aiPkg;
+const {
+  AI_DEMO_MODE,
+  extractAiResponse,
+  requireOnline,
+  setSimulateOffline,
+  isSimulateOffline,
+  isOffline,
+  pickShortJobModel,
+  __setNanoAvailableForTest,
+  parseSupplierMessage,
+  askStallSmart,
+  getDailySummary,
+} = aiPkg;
 const { isPlaceholderConfig, RC_DEFAULTS, firebaseConfig, APP_CHECK_DEBUG_TOKEN } = cfgPkg;
 
 // ---------------------------------------------------------------------------
@@ -469,6 +482,195 @@ assert(
   extractedOnDevice.inferenceSource === "on_device" &&
   extractedInCloud.inferenceSource === "in_cloud",
   "extractAiResponse returns raw SDK source values ('on_device'/'in_cloud') for badge mapping"
+);
+
+// ---------------------------------------------------------------------------
+// 31-42. M3f regression tests — "Invalid Date" + offline cloud-fallback leak
+//
+// Bug 1 (live verification 2026-11-18): live Firestore docs carry createdAt /
+// soldAt as Timestamp objects; the UI formatted them with new Date(value),
+// and new Date(Timestamp) is an Invalid Date — every saved item showed
+// "Invalid Date" in the ADDED column and sales never matched "today".
+// Fix: store.js normalizeDocDates() (Timestamp → ISO string) + defensive
+// shortDate() in main.js (never prints "Invalid Date").
+//
+// Bug 2 (live verification 2026-11-18): with "Simulate offline" ON, a short
+// parse SUCCEEDED with an IN-CLOUD badge even though Nano was unavailable
+// and cloud was supposed to be blocked. Root cause (SDK source,
+// callCloudOrDevice): PREFER_ON_DEVICE silently falls back to the cloud
+// when Nano is unavailable, and ai.js only called requireOnline() on the
+// explicit cloud route — the short path never gated at all. The badge was
+// honest (it WAS in-cloud); the offline promise was broken. Fix: short
+// jobs use an ONLY_ON_DEVICE instance while offline (fails fast, no
+// network call when Nano is unavailable) + fast-fail when Nano is known
+// unavailable; probeOnDevice() also uses ONLY_ON_DEVICE now.
+// ---------------------------------------------------------------------------
+
+/** Mirror of main.js shortDate (main.js has DOM calls at import, so the
+ *  harness mirrors its logic like it already does for calcDashboard). */
+function shortDate(value) {
+  if (!value) return "—";
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+/** Fake Firestore Timestamp (same shape the web SDK returns). */
+function fakeTimestamp(iso) {
+  const d = new Date(iso);
+  return { seconds: Math.floor(d.getTime() / 1000), nanoseconds: 0, toDate: () => d };
+}
+
+// 31. normalizeDocDates converts a Timestamp to an ISO string.
+const normTs = normalizeDocDates({
+  name: "Rice 10kg", quantity: 5, createdAt: fakeTimestamp("2026-11-18T10:00:00.000Z"),
+});
+assertEqual(
+  normTs.createdAt,
+  "2026-11-18T10:00:00.000Z",
+  "normalizeDocDates converts a Firestore Timestamp to an ISO string"
+);
+assertEqual(normTs.name, "Rice 10kg", "normalizeDocDates leaves non-date fields untouched");
+
+// 32. normalizeDocDates handles the other shapes it can meet.
+assertEqual(
+  normalizeDocDates({ soldAt: new Date("2026-11-17T08:30:00.000Z") }).soldAt,
+  "2026-11-17T08:30:00.000Z",
+  "normalizeDocDates converts a Date instance to an ISO string"
+);
+assertEqual(
+  normalizeDocDates({ createdAt: "2026-11-18T10:00:00.000Z" }).createdAt,
+  "2026-11-18T10:00:00.000Z",
+  "normalizeDocDates passes an ISO string through unchanged"
+);
+assertEqual(
+  normalizeDocDates({ createdAt: null }).createdAt,
+  null,
+  "normalizeDocDates leaves a pending null timestamp as null"
+);
+assertEqual(
+  normalizeDocDates({ createdAt: { seconds: Math.floor(new Date("2026-11-18T10:00:00.000Z").getTime() / 1000) } }).createdAt,
+  "2026-11-18T10:00:00.000Z",
+  "normalizeDocDates converts a bare { seconds } timestamp shape"
+);
+assertEqual(
+  normalizeDocDates({ name: "Oil" }).createdAt,
+  undefined,
+  "normalizeDocDates leaves a doc without date fields alone"
+);
+
+// 33. The normalised value actually formats as a real date (the old bug:
+//   new Date(Timestamp) → Invalid Date → "Invalid Date" in the ADDED column).
+assertEqual(
+  shortDate(normTs.createdAt),
+  "Nov 18",
+  "shortDate renders the normalised createdAt as a real date (Nov 18)"
+);
+assert(
+  !isNaN(new Date(normTs.createdAt).getTime()),
+  "normalised createdAt parses to a valid Date"
+);
+
+// 34. Defensive shortDate never prints "Invalid Date", even if a raw
+//   Timestamp-shaped value slipped through (what main.js used to receive).
+assertEqual(shortDate(null), "—", "shortDate returns '—' for a null (pending) date");
+assertEqual(shortDate(undefined), "—", "shortDate returns '—' for undefined");
+assertEqual(shortDate("garbage"), "—", "shortDate returns '—' for garbage input");
+assertEqual(
+  shortDate(fakeTimestamp("2026-11-18T10:00:00.000Z")),
+  "—",
+  "shortDate returns '—' (not 'Invalid Date') for a raw Timestamp-shaped value"
+);
+
+// 35. isOffline() reflects real offline state and the simulation toggle.
+assert(isOffline() === false, "isOffline() is false when online and simulation is off");
+setSimulateOffline(true);
+assert(isOffline() === true, "isOffline() is true when the offline simulation is on");
+setSimulateOffline(false);
+_onLine = false;
+assert(isOffline() === true, "isOffline() is true when navigator is offline");
+_onLine = true;
+assert(isOffline() === false, "isOffline() is false again when back online");
+
+// 36. pickShortJobModel() routes short jobs to ONLY_ON_DEVICE while offline
+//   (the M3f routing fix — the old code never gated the short path at all).
+assertEqual(pickShortJobModel(), "on-device-prefer", "pickShortJobModel() is 'on-device-prefer' when online");
+setSimulateOffline(true);
+assertEqual(pickShortJobModel(), "on-device-only", "pickShortJobModel() is 'on-device-only' when the offline simulation is on");
+setSimulateOffline(false);
+_onLine = false;
+assertEqual(pickShortJobModel(), "on-device-only", "pickShortJobModel() is 'on-device-only' when navigator is offline");
+_onLine = true;
+assertEqual(pickShortJobModel(), "on-device-prefer", "pickShortJobModel() is 'on-device-prefer' again when back online");
+
+// 37-40. Full-path offline tests: simulated-offline short parse / ask /
+//   daily summary with on-device KNOWN unavailable must fail with
+//   needs-internet and never claim IN-CLOUD (the exact M3f regression).
+//   No network is touched: the fast-fail throws before any model call.
+//   (The unknown-availability case relies on the browser's chrome adapter
+//   for ONLY_ON_DEVICE and is covered by live browser verification, not
+//   here — Node has no adapter, so it cannot exercise that path.)
+async function assertRejectsNeedsInternet(promise, description) {
+  try {
+    const result = await promise;
+    console.error(`  ❌  ${description}`);
+    console.error(`       expected a needsInternet rejection, got: ${JSON.stringify(result)}`);
+    failed++;
+  } catch (e) {
+    if (e && e.needsInternet === true) {
+      console.log(`  ✅  ${description}`);
+      passed++;
+    } else {
+      console.error(`  ❌  ${description}`);
+      console.error(`       expected needsInternet=true, got: ${e && e.message}`);
+      failed++;
+    }
+  }
+}
+
+__setNanoAvailableForTest(false);
+setSimulateOffline(true);
+
+// 37. Short parse, simulated offline, Nano known unavailable → needs-internet.
+await assertRejectsNeedsInternet(
+  parseSupplierMessage("Delivered 10 sacks rice @ $12, 5 bottles oil @ $3"),
+  "simulated-offline short parse with Nano unavailable rejects with needsInternet (never IN-CLOUD)"
+);
+
+// 38. Long parse, simulated offline → needs-internet (requireOnline gate).
+await assertRejectsNeedsInternet(
+  parseSupplierMessage("Rice 10kg x5 sacks @$12.00, ".repeat(100)),
+  "simulated-offline long parse rejects with needsInternet (cloud route gated)"
+);
+
+// 39. Short Ask, simulated offline, Nano known unavailable → needs-internet.
+await assertRejectsNeedsInternet(
+  askStallSmart("Is $12/sack for rice a good price?"),
+  "simulated-offline short Ask with Nano unavailable rejects with needsInternet"
+);
+
+// 40. Daily summary, simulated offline, Nano known unavailable → needs-internet.
+await assertRejectsNeedsInternet(
+  getDailySummary({ revenue: 43.40, cost: 34.40, profit: 9.00, topItems: [] }),
+  "simulated-offline daily summary with Nano unavailable rejects with needsInternet"
+);
+
+// 41. State is restored after the offline tests.
+setSimulateOffline(false);
+__setNanoAvailableForTest(null);
+_onLine = true;
+assert(isOffline() === false, "isOffline() is false after the offline tests clean up");
+assertEqual(pickShortJobModel(), "on-device-prefer", "pickShortJobModel() is back to 'on-device-prefer' after cleanup");
+
+// 42. Dashboard maths still counts a sale whose soldAt is an ISO string
+//   (the normalised live shape) — the old Timestamp shape never matched
+//   "today" (Invalid Date), so the dashboard stayed $0.00 after a sale.
+const dashWithIsoSale = calcDashboard([
+  { itemName: "Rice 10kg", quantity: 2, salePriceUsd: 14.50, costPriceUsd: 12.00, soldAt: new Date().toISOString() },
+]);
+assert(
+  dashWithIsoSale.count === 1 && Math.abs(dashWithIsoSale.revenue - 29.00) < 0.01,
+  "dashboard counts a sale with an ISO-string soldAt as today's revenue ($29.00)"
 );
 
 // ---------------------------------------------------------------------------

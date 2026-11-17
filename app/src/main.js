@@ -74,13 +74,15 @@ const setHidden = (element, hidden) => element.classList.toggle("hidden", hidden
 /** Format a number as USD */
 const usd = (n) => `$${Number(n).toFixed(2)}`;
 
-/** Format an ISO date string as a short date */
-const shortDate = (iso) => {
-  try {
-    return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-  } catch {
-    return "—";
-  }
+/** Format a date value as a short date — never prints "Invalid Date".
+ * Live Firestore docs are normalised to ISO strings by store.js, but a
+ * pending write can still be null and old docs could carry a Timestamp:
+ * both render as "—" instead of "Invalid Date" (M3f). */
+const shortDate = (value) => {
+  if (!value) return "—";
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 };
 
 /**
@@ -602,7 +604,7 @@ function initDashboardSummaries() {
         setHidden(el("daily-summary-loading"), true);
         const errEl = el("summary-error");
         errEl.textContent = err.needsInternet
-          ? "⚠ Daily summary ran on-device but cloud fallback needed internet. Please reconnect."
+          ? "⚠ This request needs an internet connection. Please check your signal and try again."
           : `⚠ Could not generate daily summary: ${err.message}`;
         setHidden(errEl, false);
         return;

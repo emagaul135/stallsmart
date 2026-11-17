@@ -17,8 +17,14 @@
  * Both functions return an inferenceSource badge string:
  *   "ON_DEVICE" | "IN_CLOUD"
  *
- * Offline degradation: when navigator.onLine is false, cloud calls are blocked
- * immediately and a needs-internet error is thrown with { needsInternet: true }.
+ * Offline degradation: when navigator.onLine is false (or the "Simulate
+ * offline" demo toggle is on), cloud calls are blocked immediately and a
+ * needs-internet error is thrown with { needsInternet: true }. Short jobs
+ * run on an ONLY_ON_DEVICE model instance while offline — PREFER_ON_DEVICE
+ * silently falls back to the cloud when Nano is unavailable (SDK
+ * callCloudOrDevice), so it must never be called while offline (M3f root
+ * cause: a simulated-offline short parse succeeded via the cloud fallback
+ * and its badge honestly said IN-CLOUD, breaking the offline promise).
  *
  * On-device parse fail: if on-device returns unparseable JSON, one cloud retry
  * is attempted before giving up.
@@ -50,7 +56,14 @@ export const AI_DEMO_MODE = isPlaceholderConfig();
 
 let _aiOnDevice  = null;
 let _aiInCloud   = null;
+let _aiOnDeviceOnly = null; // ONLY_ON_DEVICE instance (no cloud fallback)
 let _initialized = false;
+
+// Cached on-device availability (null = unknown). Populated by
+// probeOnDevice(). Used to fast-fail offline jobs without any model call
+// when Nano is KNOWN unavailable — so no network traffic can happen while
+// offline, in any environment.
+let _nanoAvailable = null;
 
 function initAI() {
   if (_initialized || AI_DEMO_MODE) return;
@@ -79,6 +92,17 @@ function initAI() {
   const aiInCloudSvc = getAI(app);
   _aiInCloud = getGenerativeModel(aiInCloudSvc, {
     mode: InferenceMode.PREFER_IN_CLOUD,
+    inCloudParams: { model: "gemini-3.5-flash-lite" },
+  });
+
+  // On-device ONLY instance (ONLY_ON_DEVICE, no cloud fallback).
+  // Used for short jobs while offline (real or simulated): PREFER_ON_DEVICE
+  // silently falls back to the cloud when Nano is unavailable, so calling
+  // it while offline would let a "blocked" cloud call happen and succeed
+  // (M3f). ONLY_ON_DEVICE fails fast with no network call when Nano is
+  // unavailable (SDK callCloudOrDevice throws UNSUPPORTED).
+  _aiOnDeviceOnly = getGenerativeModel(aiOnDeviceSvc, {
+    mode: InferenceMode.ONLY_ON_DEVICE,
     inCloudParams: { model: "gemini-3.5-flash-lite" },
   });
 }
@@ -213,6 +237,55 @@ export function isSimulateOffline() {
 }
 
 /**
+ * True when cloud calls must not happen: real offline OR the "Simulate
+ * offline" demo toggle. Exported so the harness (and UI) can test it.
+ */
+export function isOffline() {
+  return _simulateOffline || !navigator.onLine;
+}
+
+/** The needs-internet error (same message requireOnline() throws). */
+function needsInternetError() {
+  const err = new Error("This request needs an internet connection. Please check your signal and try again.");
+  err.needsInternet = true;
+  return err;
+}
+
+/**
+ * Which model a short (on-device-routed) job runs on.
+ * Offline → "on-device-only" (ONLY_ON_DEVICE instance, no cloud fallback);
+ * online → "on-device-prefer" (PREFER_ON_DEVICE, Nano with cloud fallback).
+ * Exported so the harness can assert the offline routing decision — the
+ * M3f bug was that the short path never gated on offline at all.
+ */
+export function pickShortJobModel() {
+  return isOffline() ? "on-device-only" : "on-device-prefer";
+}
+
+/** Resolve pickShortJobModel() to the actual model instance. */
+function shortJobModel() {
+  return pickShortJobModel() === "on-device-only" ? _aiOnDeviceOnly : _aiOnDevice;
+}
+
+/**
+ * Fast-fail for offline short jobs when Nano is KNOWN unavailable: throw
+ * needs-internet before any model call, so no network traffic can happen
+ * while offline, in any environment. When availability is unknown or true,
+ * the ONLY_ON_DEVICE instance is used — in a real browser it runs on Nano
+ * or throws without any network call, and the catch blocks below convert
+ * that throw into the same needs-internet error.
+ */
+function throwIfOfflineAndNanoUnavailable() {
+  if (isOffline() && _nanoAvailable === false) throw needsInternetError();
+}
+
+// Test seam (harness only): override the cached on-device availability.
+// Production code never calls this — probeOnDevice() is the real source.
+export function __setNanoAvailableForTest(value) {
+  _nanoAvailable = value;
+}
+
+/**
  * Try to parse the model's text response as JSON items array.
  * Returns the array or null on failure.
  */
@@ -235,11 +308,7 @@ function tryParseItems(text) {
  * show the right message. Exported so the harness can test it for real.
  */
 export function requireOnline() {
-  if (_simulateOffline || !navigator.onLine) {
-    const err = new Error("This request needs an internet connection. Please check your signal and try again.");
-    err.needsInternet = true;
-    throw err;
-  }
+  if (isOffline()) throw needsInternetError();
 }
 
 // ---------------------------------------------------------------------------
@@ -258,13 +327,16 @@ export async function parseSupplierMessage(text) {
   initAI();
 
   const isLong = text.trim().length > 2000;
-  const model  = isLong ? _aiInCloud : _aiOnDevice;
   const reason = isLong
     ? `Long document (${text.trim().length} chars > 2 000) — sending to the cloud.`
     : `Short message (${text.trim().length} chars ≤ 2 000) — running on-device.`;
 
-  // Cloud calls need internet.
+  // Cloud calls need internet. Short jobs use the ONLY_ON_DEVICE instance
+  // while offline (never PREFER_ON_DEVICE — its silent cloud fallback is
+  // the M3f bug) and fast-fail when Nano is known unavailable.
   if (isLong) requireOnline();
+  else throwIfOfflineAndNanoUnavailable();
+  const model = isLong ? _aiInCloud : shortJobModel();
 
   const prompt = [
     "Extract all items from this supplier message into a JSON array.",
@@ -295,8 +367,10 @@ export async function parseSupplierMessage(text) {
     response = extracted; // from here on, `response` is { text, inferenceSource }
   } catch (err) {
     // If the error is offline-related on an on-device model, check online and
-    // propagate.
-    if (!navigator.onLine || _simulateOffline) {
+    // propagate. (When offline, the ONLY_ON_DEVICE call throws if Nano is
+    // unavailable — that throw becomes needs-internet here, never a cloud
+    // result, because no cloud call was made.)
+    if (isOffline()) {
       requireOnline(); // throws needsInternet
     }
     throw err;
@@ -321,7 +395,7 @@ export async function parseSupplierMessage(text) {
       inferenceSourceValue = retryExtracted.inferenceSource;
       items = tryParseItems(retryExtracted.text);
     } catch (retryErr) {
-      if (!navigator.onLine || _simulateOffline) requireOnline();
+      if (isOffline()) requireOnline();
       throw retryErr;
     }
   }
@@ -365,12 +439,16 @@ export async function askStallSmart(question) {
   initAI();
 
   const isLong = question.trim().length >= 500;
-  const model  = isLong ? _aiInCloud : _aiOnDevice;
   const reason = isLong
     ? `Long question (${question.trim().length} chars ≥ 500) — running in the cloud.`
     : `Short question (${question.trim().length} chars < 500) — running on-device.`;
 
+  // Same offline rule as parse: long jobs need internet; short jobs use the
+  // ONLY_ON_DEVICE instance while offline and fast-fail if Nano is known
+  // unavailable (M3f — PREFER_ON_DEVICE's silent cloud fallback).
   if (isLong) requireOnline();
+  else throwIfOfflineAndNanoUnavailable();
+  const model = isLong ? _aiInCloud : shortJobModel();
 
   const prompt = [
     "You are StallSmart, an AI assistant for small market vendors.",
@@ -387,7 +465,7 @@ export async function askStallSmart(question) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine || _simulateOffline) requireOnline();
+    if (isOffline()) requireOnline();
     throw err;
   }
 
@@ -433,13 +511,18 @@ export async function getDailySummary(salesData) {
     `  Top sellers: ${topText}`,
   ].join("\n");
 
+  // Daily summaries are always on-device-routed: same offline rule as
+  // parse/ask — ONLY_ON_DEVICE while offline, fast-fail if Nano is known
+  // unavailable (M3f).
+  throwIfOfflineAndNanoUnavailable();
+
   let response;
   try {
-    response = await _aiOnDevice.generateContent({
+    response = await shortJobModel().generateContent({
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine || _simulateOffline) requireOnline();
+    if (isOffline()) requireOnline();
     throw err;
   }
 
@@ -498,7 +581,7 @@ export async function getWeeklySummary(salesRows, maxChars = 4000) {
       contents: [{ role: "user", parts: [{ text: prompt }] }],
     });
   } catch (err) {
-    if (!navigator.onLine || _simulateOffline) requireOnline();
+    if (isOffline()) requireOnline();
     throw err;
   }
 
@@ -531,7 +614,11 @@ export async function probeOnDevice() {
   try {
     initAI();
 
-    const response = await _aiOnDevice.generateContent({
+    // Probe with the ONLY_ON_DEVICE instance (M3f): PREFER_ON_DEVICE would
+    // silently fall back to the cloud when Nano is unavailable, so the probe
+    // itself would make a cloud call. ONLY_ON_DEVICE is a pure local
+    // availability check — no network traffic, ever.
+    const response = await _aiOnDeviceOnly.generateContent({
       contents: [{ role: "user", parts: [{ text: "Reply with the single word: ready" }] }],
     });
 
@@ -539,12 +626,14 @@ export async function probeOnDevice() {
     // NOTE: generateContent() returns a { response } wrapper — the source
     // lives on the unwrapped response (see extractAiResponse).
     const src = extractAiResponse(response).inferenceSource;
-    return (
+    const available =
       src === InferenceSource.ON_DEVICE ||
-      src === "on_device"
-    );
+      src === "on_device";
+    _nanoAvailable = available;
+    return available;
   } catch {
-    // Any failure (network, model not ready, etc.) = unavailable.
+    // Any failure (model not ready, API unavailable, etc.) = unavailable.
+    _nanoAvailable = false;
     return false;
   }
 }

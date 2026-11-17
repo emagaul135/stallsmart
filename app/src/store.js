@@ -19,6 +19,17 @@
  *   stock  { name, quantity, unit, unitPriceUsd, source, createdAt }
  *   sales  { itemId, itemName, quantity, salePriceUsd, costPriceUsd, soldAt }
  *
+ * Timestamps: live writes use CLIENT ISO timestamps (new Date().toISOString())
+ * for createdAt/soldAt, not serverTimestamp(). Rationale (M3f): this app is
+ * offline-first — a pending serverTimestamp is null until the server acks,
+ * so an offline-saved item would show "—" in the ADDED column and a just-
+ * logged sale would not count in today's dashboard until the ack arrived.
+ * Client time is the correct semantic here (when the vendor logged it) and
+ * ISO strings sort chronologically, exactly like server timestamps.
+ * Reads still normalise any Firestore Timestamp (e.g. docs written earlier
+ * with serverTimestamp) via normalizeDocDates() below, so live and demo
+ * data always have the same shape (ISO strings or null).
+ *
  * App Check:
  *   Local development: a debug token (app/.env.local, gitignored, never
  *   committed) is set on self.FIREBASE_APPCHECK_DEBUG_TOKEN before the SDK
@@ -66,6 +77,56 @@ const _rcCache = { ...RC_DEFAULTS };
  */
 export function getRemoteConfigValue(key) {
   return key in _rcCache ? _rcCache[key] : (RC_DEFAULTS[key] ?? null);
+}
+
+// ---------------------------------------------------------------------------
+// Date normalisation (M3f — "Invalid Date" bug)
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise a Firestore document's date fields to ISO strings.
+ *
+ * ROOT CAUSE (live verification 2026-11-18): live docs carry `createdAt` /
+ * `soldAt` as Firestore Timestamp objects (serverTimestamp()), while demo
+ * data uses ISO strings. The UI formatted them with `new Date(value)` —
+ * `new Date(Timestamp)` is an Invalid Date (a Timestamp is an object, not
+ * a string/number), so every saved item showed "Invalid Date" in the
+ * Inventory ADDED column, and sales never matched "today" in the dashboard
+ * (new Date(Timestamp).toDateString() === "Invalid Date").
+ *
+ * This converts Timestamp → ISO string (via .toDate()), Date → ISO string,
+ * passes ISO strings through, and leaves null (pending write) as null.
+ * Exported so the harness can test it with a real Timestamp shape.
+ *
+ * @param {object} data - a Firestore document's data (or any plain object)
+ * @returns {object} a copy with createdAt/soldAt normalised
+ */
+export function normalizeDocDates(data) {
+  if (!data || typeof data !== "object") return data;
+  const out = { ...data };
+  for (const key of ["createdAt", "soldAt"]) {
+    const v = out[key];
+    if (v && typeof v.toDate === "function") {
+      // Firestore Timestamp (also covers Timestamp-like { seconds } shapes
+      // via toDate; the seconds fallback below is belt-and-braces).
+      try {
+        out[key] = v.toDate().toISOString();
+      } catch {
+        out[key] = null;
+      }
+    } else if (v instanceof Date) {
+      out[key] = isNaN(v.getTime()) ? null : v.toISOString();
+    } else if (typeof v === "number") {
+      out[key] = new Date(v).toISOString();
+    } else if (v && typeof v === "object" && typeof v.seconds === "number") {
+      out[key] = new Date(v.seconds * 1000).toISOString();
+    } else if (typeof v === "string" || v == null) {
+      // ISO string (demo data + new live writes) or pending null — keep.
+    } else {
+      out[key] = null;
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +337,7 @@ export async function addStockItems(items, source = "ai-parsed") {
   }
 
   // Live mode
-  const { addDoc, getDocs, query, where, updateDoc, doc, serverTimestamp }
+  const { addDoc, getDocs, query, where, updateDoc, doc }
     = await import("firebase/firestore");
 
   for (const item of items) {
@@ -290,13 +351,16 @@ export async function addStockItems(items, source = "ai-parsed") {
         quantity: existing.data().quantity + item.quantity,
       });
     } else {
+      // Client ISO timestamp (see header comment): a pending
+      // serverTimestamp() would be null until the server acks, so the
+      // ADDED column would show "—" for a just-saved item.
       await addDoc(_stockRef, {
         name:         item.name,
         quantity:     item.quantity,
         unit:         item.unit,
         unitPriceUsd: item.unitPriceUsd,
         source,
-        createdAt:    serverTimestamp(),
+        createdAt:    new Date().toISOString(),
       });
     }
   }
@@ -335,7 +399,9 @@ export function onStockChange(callback) {
     if (_cancelled) return;
     const q = query(_stockRef, orderBy("createdAt", "desc"));
     _unsub = onSnapshot(q, (snap) => {
-      const items = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // Normalise Firestore Timestamps to ISO strings (M3f) so the UI
+      // never sees a Timestamp object (new Date(Timestamp) is Invalid).
+      const items = snap.docs.map((d) => ({ id: d.id, ...normalizeDocDates(d.data()) }));
       callback(items);
     }, (err) => {
       console.error("StallSmart: stock listener error —", err);
@@ -373,7 +439,9 @@ export function onSalesChange(callback) {
     if (_cancelled) return;
     const q = query(_salesRef, orderBy("soldAt", "desc"));
     _unsub = onSnapshot(q, (snap) => {
-      const salesItems = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      // Same Timestamp normalisation as stock (M3f): without it, sales
+      // never matched "today" in the dashboard (Invalid Date).
+      const salesItems = snap.docs.map((d) => ({ id: d.id, ...normalizeDocDates(d.data()) }));
       callback(salesItems);
     }, (err) => {
       console.error("StallSmart: sales listener error —", err);
@@ -407,10 +475,13 @@ export async function logSale(saleRecord) {
     return;
   }
 
-  const { addDoc, serverTimestamp } = await import("firebase/firestore");
+  const { addDoc } = await import("firebase/firestore");
+  // Client ISO timestamp (see header comment): a pending serverTimestamp()
+  // is null until the server acks, so a just-logged sale would not count
+  // in today's dashboard until the ack arrived.
   await addDoc(_salesRef, {
     ...saleRecord,
-    soldAt: serverTimestamp(),
+    soldAt: new Date().toISOString(),
   });
 }
 
