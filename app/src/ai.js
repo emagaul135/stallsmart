@@ -72,14 +72,14 @@ function initAI() {
   const aiOnDeviceSvc = getAI(app);
   _aiOnDevice = getGenerativeModel(aiOnDeviceSvc, {
     mode: InferenceMode.PREFER_ON_DEVICE,
-    inCloudParams: { model: "gemini-3.5-flash-lite" },
+    inCloudParams: { model: "gemini-2.5-flash-lite" },
   });
 
   // Cloud model instance (PREFER_IN_CLOUD).
   const aiInCloudSvc = getAI(app);
   _aiInCloud = getGenerativeModel(aiInCloudSvc, {
     mode: InferenceMode.PREFER_IN_CLOUD,
-    inCloudParams: { model: "gemini-3.5-flash-lite" },
+    inCloudParams: { model: "gemini-2.5-flash-lite" },
   });
 }
 
